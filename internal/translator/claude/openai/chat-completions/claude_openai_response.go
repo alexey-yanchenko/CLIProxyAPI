@@ -207,10 +207,11 @@ func ConvertClaudeResponseToOpenAI(_ context.Context, modelName string, original
 			outputTokens := usage.Get("output_tokens").Int()
 			cacheReadInputTokens := usage.Get("cache_read_input_tokens").Int()
 			cacheCreationInputTokens := usage.Get("cache_creation_input_tokens").Int()
-			template, _ = sjson.Set(template, "usage.prompt_tokens", inputTokens+cacheCreationInputTokens)
+			template, _ = sjson.Set(template, "usage.prompt_tokens", inputTokens+cacheCreationInputTokens+cacheReadInputTokens)
 			template, _ = sjson.Set(template, "usage.completion_tokens", outputTokens)
 			template, _ = sjson.Set(template, "usage.total_tokens", inputTokens+outputTokens)
 			template, _ = sjson.Set(template, "usage.prompt_tokens_details.cached_tokens", cacheReadInputTokens)
+			template, _ = sjson.Set(template, "usage.prompt_tokens_details.cache_write_tokens", cacheCreationInputTokens)
 		}
 		return []string{template}
 
