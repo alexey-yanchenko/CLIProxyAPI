@@ -42,12 +42,16 @@ func ConvertOpenAIRequestToAntigravity(modelName string, inputRawJSON []byte, _ 
 		if effort != "" {
 			thinkingPath := "request.generationConfig.thinkingConfig"
 			if effort == "auto" {
-				out, _ = sjson.SetBytes(out, thinkingPath+".thinkingBudget", -1)
-				out, _ = sjson.SetBytes(out, thinkingPath+".includeThoughts", true)
-			} else {
-				out, _ = sjson.SetBytes(out, thinkingPath+".thinkingLevel", effort)
-				out, _ = sjson.SetBytes(out, thinkingPath+".includeThoughts", effort != "none")
-			}
+					out, _ = sjson.SetBytes(out, thinkingPath+".thinkingBudget", -1)
+					out, _ = sjson.SetBytes(out, thinkingPath+".includeThoughts", true)
+				} else {
+					mappedEffort := effort
+					if effort == "xhigh" {
+						mappedEffort = "high"
+					}
+					out, _ = sjson.SetBytes(out, thinkingPath+".thinkingLevel", mappedEffort)
+					out, _ = sjson.SetBytes(out, thinkingPath+".includeThoughts", mappedEffort != "none")
+				}
 		}
 	}
 
