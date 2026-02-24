@@ -156,8 +156,12 @@ func ConvertOpenAIRequestToClaude(modelName string, inputRawJSON []byte, stream 
 				} else if contentResult.Exists() && contentResult.IsArray() {
 					contentResult.ForEach(func(_, part gjson.Result) bool {
 						if part.Get("type").String() == "text" {
+							textContent := part.Get("text").String()
+							if textContent == "" {
+								return true
+							}
 							textPart := `{"type":"text","text":""}`
-							textPart, _ = sjson.Set(textPart, "text", part.Get("text").String())
+							textPart, _ = sjson.Set(textPart, "text", textContent)
 							// Add cache_control if present
 							if cacheControl := part.Get("cache_control"); cacheControl.Exists() {
 								if cacheControl.Get("type").String() == "ephemeral" {
@@ -184,8 +188,12 @@ func ConvertOpenAIRequestToClaude(modelName string, inputRawJSON []byte, stream 
 
 						switch partType {
 						case "text":
+							textContent := part.Get("text").String()
+							if textContent == "" {
+								return true
+							}
 							textPart := `{"type":"text","text":""}`
-							textPart, _ = sjson.Set(textPart, "text", part.Get("text").String())
+							textPart, _ = sjson.Set(textPart, "text", textContent)
 							// Add cache_control if present
 							if cacheControl := part.Get("cache_control"); cacheControl.Exists() {
 								if cacheControl.Get("type").String() == "ephemeral" {
