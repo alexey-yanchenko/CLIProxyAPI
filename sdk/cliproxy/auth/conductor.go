@@ -1291,11 +1291,11 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 					state.NextRetryAfter = next
 					suspendReason = "payment_required"
 					shouldSuspendModel = true
-				case 404:
-					next := now.Add(12 * time.Hour)
-					state.NextRetryAfter = next
-					suspendReason = "not_found"
-					shouldSuspendModel = true
+				// case 404:
+				// 	next := now.Add(12 * time.Hour)
+				// 	state.NextRetryAfter = next
+				// 	suspendReason = "not_found"
+				// 	shouldSuspendModel = true
 				case 429:
 					var next time.Time
 					backoffLevel := state.Quota.BackoffLevel
