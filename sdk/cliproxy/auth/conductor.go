@@ -1332,8 +1332,35 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 				auth.Status = StatusError
 				auth.UpdatedAt = now
 				updateAggregatedAvailability(auth, now)
+				if auth.Unavailable {
+					entry := logEntryWithRequestID(ctx)
+					errMsg := ""
+					if result.Error != nil {
+						errMsg = result.Error.Message
+					}
+					entry.WithFields(log.Fields{
+						"auth_id":     auth.ID,
+						"provider":    result.Provider,
+						"model":       result.Model,
+						"http_status": statusCode,
+						"error":       errMsg,
+					}).Warn("auth marked unavailable due to model error")
+				}
 			} else {
 				applyAuthFailureState(auth, result.Error, result.RetryAfter, now)
+				entry := logEntryWithRequestID(ctx)
+				errMsg := ""
+				httpStatus := 0
+				if result.Error != nil {
+					errMsg = result.Error.Message
+					httpStatus = result.Error.HTTPStatus
+				}
+				entry.WithFields(log.Fields{
+					"auth_id":     auth.ID,
+					"provider":    result.Provider,
+					"http_status": httpStatus,
+					"error":       errMsg,
+				}).Warn("auth marked unavailable")
 			}
 		}
 
