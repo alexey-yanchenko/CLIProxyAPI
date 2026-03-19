@@ -54,6 +54,8 @@ func ConvertOpenAIRequestToAntigravity(modelName string, inputRawJSON []byte, _ 
 				out, _ = sjson.SetBytes(out, thinkingPath+".includeThoughts", effort != "none")
 			}
 		}
+	} else {
+		out, _ = sjson.SetBytes(out, "request.generationConfig.thinkingConfig.includeThoughts", true)
 	}
 
 	// Temperature/top_p/top_k/max_tokens
