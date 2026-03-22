@@ -204,14 +204,15 @@ func ConvertAntigravityResponseToOpenAI(_ context.Context, _ string, originalReq
 		if cachedUsage := (*param).(*convertCliResponseToOpenAIChatParams).CachedUsageMetadata; cachedUsage != "" {
 			usageResult := gjson.Parse(cachedUsage)
 			cachedTokenCount := usageResult.Get("cachedContentTokenCount").Int()
-			if candidatesTokenCountResult := usageResult.Get("candidatesTokenCount"); candidatesTokenCountResult.Exists() {
-				template, _ = sjson.Set(template, "usage.completion_tokens", candidatesTokenCountResult.Int())
+			candidatesTokenCount := usageResult.Get("candidatesTokenCount").Int()
+			thoughtsTokenCount := usageResult.Get("thoughtsTokenCount").Int()
+			if usageResult.Get("candidatesTokenCount").Exists() {
+				template, _ = sjson.Set(template, "usage.completion_tokens", candidatesTokenCount+thoughtsTokenCount)
 			}
 			if totalTokenCountResult := usageResult.Get("totalTokenCount"); totalTokenCountResult.Exists() {
 				template, _ = sjson.Set(template, "usage.total_tokens", totalTokenCountResult.Int())
 			}
 			promptTokenCount := usageResult.Get("promptTokenCount").Int()
-			thoughtsTokenCount := usageResult.Get("thoughtsTokenCount").Int()
 			template, _ = sjson.Set(template, "usage.prompt_tokens", promptTokenCount)
 			if thoughtsTokenCount > 0 {
 				template, _ = sjson.Set(template, "usage.completion_tokens_details.reasoning_tokens", thoughtsTokenCount)
