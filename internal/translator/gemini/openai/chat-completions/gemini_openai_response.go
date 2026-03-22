@@ -14,6 +14,7 @@ import (
 	"time"
 
 	log "github.com/sirupsen/logrus"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/translator/imageutil"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
@@ -311,6 +312,8 @@ func ConvertGeminiResponseToOpenAINonStream(_ context.Context, _ string, origina
 		}
 	}
 
+	var totalImageTokens int64
+
 	// Process the main content part of the response for all candidates.
 	candidates := gjson.GetBytes(rawJSON, "candidates")
 	if candidates.IsArray() {
@@ -387,6 +390,7 @@ func ConvertGeminiResponseToOpenAINonStream(_ context.Context, _ string, origina
 							imagePayload, _ = sjson.Set(imagePayload, "image_url.url", imageURL)
 							choiceTemplate, _ = sjson.Set(choiceTemplate, "message.role", "assistant")
 							choiceTemplate, _ = sjson.SetRaw(choiceTemplate, "message.images.-1", imagePayload)
+							totalImageTokens += imageutil.CountInlineDataImageTokens(data, mimeType)
 						}
 					}
 				}
@@ -401,6 +405,10 @@ func ConvertGeminiResponseToOpenAINonStream(_ context.Context, _ string, origina
 			template, _ = sjson.SetRaw(template, "choices.-1", choiceTemplate)
 			return true
 		})
+	}
+
+	if totalImageTokens > 0 {
+		template, _ = sjson.Set(template, "usage.completion_tokens_details.image_tokens", totalImageTokens)
 	}
 
 	return template

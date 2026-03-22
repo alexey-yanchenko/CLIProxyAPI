@@ -16,16 +16,19 @@ import (
 	log "github.com/sirupsen/logrus"
 
 	. "github.com/router-for-me/CLIProxyAPI/v6/internal/translator/gemini/openai/chat-completions"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/translator/imageutil"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
 
 // convertCliResponseToOpenAIChatParams holds parameters for response conversion.
 type convertCliResponseToOpenAIChatParams struct {
-	UnixTimestamp        int64
-	FunctionIndex        int
-	SawToolCall          bool   // Tracks if any tool call was seen in the entire stream
-	UpstreamFinishReason string // Caches the upstream finish reason for final chunk
+	UnixTimestamp          int64
+	FunctionIndex          int
+	SawToolCall            bool   // Tracks if any tool call was seen in the entire stream
+	UpstreamFinishReason   string // Caches the upstream finish reason for final chunk
+	AccumulatedImageTokens int64  // Accumulates image tokens across chunks
+	CachedUsageMetadata    string // Caches usageMetadata raw JSON until finishReason arrives
 }
 
 // functionCallIDCounter provides a process-wide unique counter for function call identifiers.
@@ -87,28 +90,11 @@ func ConvertAntigravityResponseToOpenAI(_ context.Context, _ string, originalReq
 	}
 
 	// Extract and set usage metadata (token counts).
+	// Also check cpaUsageMetadata — set by FilterSSEUsageMetadata on non-terminal chunks.
 	if usageResult := gjson.GetBytes(rawJSON, "response.usageMetadata"); usageResult.Exists() {
-		cachedTokenCount := usageResult.Get("cachedContentTokenCount").Int()
-		if candidatesTokenCountResult := usageResult.Get("candidatesTokenCount"); candidatesTokenCountResult.Exists() {
-			template, _ = sjson.Set(template, "usage.completion_tokens", candidatesTokenCountResult.Int())
-		}
-		if totalTokenCountResult := usageResult.Get("totalTokenCount"); totalTokenCountResult.Exists() {
-			template, _ = sjson.Set(template, "usage.total_tokens", totalTokenCountResult.Int())
-		}
-		promptTokenCount := usageResult.Get("promptTokenCount").Int()
-		thoughtsTokenCount := usageResult.Get("thoughtsTokenCount").Int()
-		template, _ = sjson.Set(template, "usage.prompt_tokens", promptTokenCount)
-		if thoughtsTokenCount > 0 {
-			template, _ = sjson.Set(template, "usage.completion_tokens_details.reasoning_tokens", thoughtsTokenCount)
-		}
-		// Include cached token count if present (indicates prompt caching is working)
-		if cachedTokenCount > 0 {
-			var err error
-			template, err = sjson.Set(template, "usage.prompt_tokens_details.cached_tokens", cachedTokenCount)
-			if err != nil {
-				log.Warnf("antigravity openai response: failed to set cached_tokens: %v", err)
-			}
-		}
+		(*param).(*convertCliResponseToOpenAIChatParams).CachedUsageMetadata = usageResult.Raw
+	} else if usageResult := gjson.GetBytes(rawJSON, "response.cpaUsageMetadata"); usageResult.Exists() {
+		(*param).(*convertCliResponseToOpenAIChatParams).CachedUsageMetadata = usageResult.Raw
 	}
 
 	// Process the main content part of the response.
@@ -191,6 +177,7 @@ func ConvertAntigravityResponseToOpenAI(_ context.Context, _ string, originalReq
 				imagePayload, _ = sjson.Set(imagePayload, "image_url.url", imageURL)
 				template, _ = sjson.Set(template, "choices.0.delta.role", "assistant")
 				template, _ = sjson.SetRaw(template, "choices.0.delta.images.-1", imagePayload)
+				(*param).(*convertCliResponseToOpenAIChatParams).AccumulatedImageTokens += imageutil.CountInlineDataImageTokens(data, mimeType)
 			}
 		}
 	}
@@ -200,8 +187,7 @@ func ConvertAntigravityResponseToOpenAI(_ context.Context, _ string, originalReq
 	upstreamFinishReason := params.UpstreamFinishReason
 	sawToolCall := params.SawToolCall
 
-	usageExists := gjson.GetBytes(rawJSON, "response.usageMetadata").Exists()
-	isFinalChunk := upstreamFinishReason != "" && usageExists
+	isFinalChunk := upstreamFinishReason != ""
 
 	if isFinalChunk {
 		var finishReason string
@@ -214,6 +200,33 @@ func ConvertAntigravityResponseToOpenAI(_ context.Context, _ string, originalReq
 		}
 		template, _ = sjson.Set(template, "choices.0.finish_reason", finishReason)
 		template, _ = sjson.Set(template, "choices.0.native_finish_reason", strings.ToLower(upstreamFinishReason))
+
+		if cachedUsage := (*param).(*convertCliResponseToOpenAIChatParams).CachedUsageMetadata; cachedUsage != "" {
+			usageResult := gjson.Parse(cachedUsage)
+			cachedTokenCount := usageResult.Get("cachedContentTokenCount").Int()
+			if candidatesTokenCountResult := usageResult.Get("candidatesTokenCount"); candidatesTokenCountResult.Exists() {
+				template, _ = sjson.Set(template, "usage.completion_tokens", candidatesTokenCountResult.Int())
+			}
+			if totalTokenCountResult := usageResult.Get("totalTokenCount"); totalTokenCountResult.Exists() {
+				template, _ = sjson.Set(template, "usage.total_tokens", totalTokenCountResult.Int())
+			}
+			promptTokenCount := usageResult.Get("promptTokenCount").Int()
+			thoughtsTokenCount := usageResult.Get("thoughtsTokenCount").Int()
+			template, _ = sjson.Set(template, "usage.prompt_tokens", promptTokenCount)
+			if thoughtsTokenCount > 0 {
+				template, _ = sjson.Set(template, "usage.completion_tokens_details.reasoning_tokens", thoughtsTokenCount)
+			}
+			if cachedTokenCount > 0 {
+				var err error
+				template, err = sjson.Set(template, "usage.prompt_tokens_details.cached_tokens", cachedTokenCount)
+				if err != nil {
+					log.Warnf("antigravity openai response: failed to set cached_tokens: %v", err)
+				}
+			}
+			if imageTokenCount := (*param).(*convertCliResponseToOpenAIChatParams).AccumulatedImageTokens; imageTokenCount > 0 {
+				template, _ = sjson.Set(template, "usage.completion_tokens_details.image_tokens", imageTokenCount)
+			}
+		}
 	}
 
 	return []string{template}
