@@ -62,6 +62,12 @@ error-logs-max-files: 10
 # When false, disable in-memory usage statistics aggregation
 usage-statistics-enabled: false
 
+# When true, enable sequential (non-parallel) request execution per Claude auth credential.
+# Only one request runs at a time per Claude credential (OAuth token or API key).
+# With N Claude credentials configured, at most N requests run concurrently; others wait in queue.
+# Useful when a Claude account allows only one concurrent session. Default: false.
+sequential-auth: false
+
 # Proxy URL. Supports socks5/http/https protocols. Example: socks5://user:pass@192.168.1.1:1080/
 # Per-entry proxy-url also supports "direct" or "none" to bypass both the global proxy-url and environment proxies explicitly.
 proxy-url: ""

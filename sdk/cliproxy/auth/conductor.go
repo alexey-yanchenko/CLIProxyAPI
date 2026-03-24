@@ -163,6 +163,15 @@ type Manager struct {
 	// Auto refresh state
 	refreshCancel    context.CancelFunc
 	refreshSemaphore chan struct{}
+
+	// sequentialAuth enables sequential per-Claude-auth request execution.
+	// When true, only one request runs at a time per Claude credential.
+	sequentialAuth atomic.Bool
+
+	// authSlotsMu guards authSlots map.
+	authSlotsMu sync.Mutex
+	// authSlots holds per-auth semaphore channels (capacity 1) for sequential mode.
+	authSlots map[string]chan struct{}
 }
 
 // NewManager constructs a manager with optional custom selector and hook.
@@ -182,6 +191,7 @@ func NewManager(store Store, selector Selector, hook Hook) *Manager {
 		providerOffsets:  make(map[string]int),
 		modelPoolOffsets: make(map[string]int),
 		refreshSemaphore: make(chan struct{}, refreshMaxConcurrency),
+		authSlots:        make(map[string]chan struct{}),
 	}
 	// atomic.Value requires non-nil initial value.
 	manager.runtimeConfig.Store(&internalconfig.Config{})
@@ -273,7 +283,28 @@ func (m *Manager) SetConfig(cfg *internalconfig.Config) {
 		cfg = &internalconfig.Config{}
 	}
 	m.runtimeConfig.Store(cfg)
+	m.sequentialAuth.Store(cfg.SequentialAuth)
 	m.rebuildAPIKeyModelAliasFromRuntimeConfig()
+}
+
+// acquireAuthSlot blocks until a slot is available for the given auth ID in sequential mode.
+// Returns a release function that must be called when the request completes.
+// If ctx is cancelled while waiting, returns a no-op release and the context error.
+func (m *Manager) acquireAuthSlot(ctx context.Context, authID string) (release func(), err error) {
+	m.authSlotsMu.Lock()
+	slot, ok := m.authSlots[authID]
+	if !ok {
+		slot = make(chan struct{}, 1)
+		m.authSlots[authID] = slot
+	}
+	m.authSlotsMu.Unlock()
+
+	select {
+	case slot <- struct{}{}:
+		return func() { <-slot }, nil
+	case <-ctx.Done():
+		return func() {}, ctx.Err()
+	}
 }
 
 func (m *Manager) lookupAPIKeyUpstreamModel(authID, requestedModel string) string {
@@ -484,9 +515,16 @@ func readStreamBootstrap(ctx context.Context, ch <-chan cliproxyexecutor.StreamC
 }
 
 func (m *Manager) wrapStreamResult(ctx context.Context, auth *Auth, provider, routeModel string, headers http.Header, buffered []cliproxyexecutor.StreamChunk, remaining <-chan cliproxyexecutor.StreamChunk) *cliproxyexecutor.StreamResult {
+	return m.wrapStreamResultWithRelease(ctx, auth, provider, routeModel, headers, buffered, remaining, nil)
+}
+
+func (m *Manager) wrapStreamResultWithRelease(ctx context.Context, auth *Auth, provider, routeModel string, headers http.Header, buffered []cliproxyexecutor.StreamChunk, remaining <-chan cliproxyexecutor.StreamChunk, release func()) *cliproxyexecutor.StreamResult {
 	out := make(chan cliproxyexecutor.StreamChunk)
 	go func() {
 		defer close(out)
+		if release != nil {
+			defer release()
+		}
 		var failed bool
 		forward := true
 		emit := func(chunk cliproxyexecutor.StreamChunk) bool {
@@ -533,7 +571,14 @@ func (m *Manager) wrapStreamResult(ctx context.Context, auth *Auth, provider, ro
 }
 
 func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor ProviderExecutor, auth *Auth, provider string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, routeModel string) (*cliproxyexecutor.StreamResult, error) {
+	return m.executeStreamWithModelPoolAndRelease(ctx, executor, auth, provider, req, opts, routeModel, nil)
+}
+
+func (m *Manager) executeStreamWithModelPoolAndRelease(ctx context.Context, executor ProviderExecutor, auth *Auth, provider string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, routeModel string, release func()) (*cliproxyexecutor.StreamResult, error) {
 	if executor == nil {
+		if release != nil {
+			release()
+		}
 		return nil, &Error{Code: "executor_not_found", Message: "executor not registered"}
 	}
 	execModels := m.prepareExecutionModels(auth, routeModel)
@@ -544,6 +589,9 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 		streamResult, errStream := executor.ExecuteStream(ctx, auth, execReq, opts)
 		if errStream != nil {
 			if errCtx := ctx.Err(); errCtx != nil {
+				if release != nil {
+					release()
+				}
 				return nil, errCtx
 			}
 			rerr := &Error{Message: errStream.Error()}
@@ -554,6 +602,9 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			result.RetryAfter = retryAfterFromError(errStream)
 			m.MarkResult(ctx, result)
 			if isRequestInvalidError(errStream) {
+				if release != nil {
+					release()
+				}
 				return nil, errStream
 			}
 			lastErr = errStream
@@ -564,6 +615,9 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 		if bootstrapErr != nil {
 			if errCtx := ctx.Err(); errCtx != nil {
 				discardStreamChunks(streamResult.Chunks)
+				if release != nil {
+					release()
+				}
 				return nil, errCtx
 			}
 			if isRequestInvalidError(bootstrapErr) {
@@ -575,6 +629,9 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 				result.RetryAfter = retryAfterFromError(bootstrapErr)
 				m.MarkResult(ctx, result)
 				discardStreamChunks(streamResult.Chunks)
+				if release != nil {
+					release()
+				}
 				return nil, bootstrapErr
 			}
 			if idx < len(execModels)-1 {
@@ -592,7 +649,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			errCh := make(chan cliproxyexecutor.StreamChunk, 1)
 			errCh <- cliproxyexecutor.StreamChunk{Err: bootstrapErr}
 			close(errCh)
-			return m.wrapStreamResult(ctx, auth.Clone(), provider, routeModel, streamResult.Headers, nil, errCh), nil
+			return m.wrapStreamResultWithRelease(ctx, auth.Clone(), provider, routeModel, streamResult.Headers, nil, errCh, release), nil
 		}
 
 		if closed && len(buffered) == 0 {
@@ -606,7 +663,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			errCh := make(chan cliproxyexecutor.StreamChunk, 1)
 			errCh <- cliproxyexecutor.StreamChunk{Err: emptyErr}
 			close(errCh)
-			return m.wrapStreamResult(ctx, auth.Clone(), provider, routeModel, streamResult.Headers, nil, errCh), nil
+			return m.wrapStreamResultWithRelease(ctx, auth.Clone(), provider, routeModel, streamResult.Headers, nil, errCh, release), nil
 		}
 
 		remaining := streamResult.Chunks
@@ -615,10 +672,13 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			close(closedCh)
 			remaining = closedCh
 		}
-		return m.wrapStreamResult(ctx, auth.Clone(), provider, routeModel, streamResult.Headers, buffered, remaining), nil
+		return m.wrapStreamResultWithRelease(ctx, auth.Clone(), provider, routeModel, streamResult.Headers, buffered, remaining, release), nil
 	}
 	if lastErr == nil {
 		lastErr = &Error{Code: "auth_not_found", Message: "no upstream model available"}
+	}
+	if release != nil {
+		release()
 	}
 	return nil, lastErr
 }
@@ -1006,6 +1066,14 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			execCtx = context.WithValue(execCtx, "cliproxy.roundtripper", rt)
 		}
 
+		if m.sequentialAuth.Load() && strings.EqualFold(strings.TrimSpace(auth.Provider), "claude") {
+			release, errSlot := m.acquireAuthSlot(execCtx, auth.ID)
+			if errSlot != nil {
+				return cliproxyexecutor.Response{}, errSlot
+			}
+			defer release()
+		}
+
 		models := m.prepareExecutionModels(auth, routeModel)
 		var authErr error
 		for _, upstreamModel := range models {
@@ -1149,7 +1217,17 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 			execCtx = context.WithValue(execCtx, roundTripperContextKey{}, rt)
 			execCtx = context.WithValue(execCtx, "cliproxy.roundtripper", rt)
 		}
-		streamResult, errStream := m.executeStreamWithModelPool(execCtx, executor, auth, provider, req, opts, routeModel)
+
+		var streamRelease func()
+		if m.sequentialAuth.Load() && strings.EqualFold(strings.TrimSpace(auth.Provider), "claude") {
+			release, errSlot := m.acquireAuthSlot(execCtx, auth.ID)
+			if errSlot != nil {
+				return nil, errSlot
+			}
+			streamRelease = release
+		}
+
+		streamResult, errStream := m.executeStreamWithModelPoolAndRelease(execCtx, executor, auth, provider, req, opts, routeModel, streamRelease)
 		if errStream != nil {
 			if errCtx := execCtx.Err(); errCtx != nil {
 				return nil, errCtx

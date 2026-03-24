@@ -67,6 +67,11 @@ type Config struct {
 	// DisableCooling disables quota cooldown scheduling when true.
 	DisableCooling bool `yaml:"disable-cooling" json:"disable-cooling"`
 
+	// SequentialAuth enables sequential (non-parallel) request execution per Claude auth.
+	// When true, only one request is executed at a time per Claude credential; others wait in queue.
+	// This eliminates parallelism per auth: with N Claude credentials, at most N concurrent requests run.
+	SequentialAuth bool `yaml:"sequential-auth" json:"sequential-auth"`
+
 	// RequestRetry defines the retry times when the request failed.
 	RequestRetry int `yaml:"request-retry" json:"request-retry"`
 	// MaxRetryCredentials defines the maximum number of credentials to try for a failed request.
