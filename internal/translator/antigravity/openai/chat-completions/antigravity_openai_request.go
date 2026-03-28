@@ -212,8 +212,13 @@ func ConvertOpenAIRequestToAntigravity(modelName string, inputRawJSON []byte, _ 
 								ext = sp[len(sp)-1]
 							}
 							if mimeType, ok := misc.MimeTypes[ext]; ok {
+								// Strip data URL prefix (e.g. "data:application/pdf;base64,") if present
+								rawData := fileData
+								if idx := strings.Index(fileData, "base64,"); idx != -1 {
+									rawData = fileData[idx+7:]
+								}
 								node, _ = sjson.SetBytes(node, "parts."+itoa(p)+".inlineData.mimeType", mimeType)
-								node, _ = sjson.SetBytes(node, "parts."+itoa(p)+".inlineData.data", fileData)
+								node, _ = sjson.SetBytes(node, "parts."+itoa(p)+".inlineData.data", rawData)
 								p++
 							} else {
 								log.Warnf("Unknown file name extension '%s' in user message, skip", ext)
