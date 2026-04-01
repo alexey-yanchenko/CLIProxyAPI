@@ -1752,10 +1752,12 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 				} else {
 					switch statusCode {
 					case 401:
-						next := now.Add(30 * time.Minute)
-						state.NextRetryAfter = next
-						suspendReason = "unauthorized"
-						shouldSuspendModel = true
+						if auth.Provider != "kimi" {
+							next := now.Add(30 * time.Minute)
+							state.NextRetryAfter = next
+							suspendReason = "unauthorized"
+							shouldSuspendModel = true
+						}
 					case 402, 403:
 						next := now.Add(30 * time.Minute)
 						state.NextRetryAfter = next
