@@ -2001,22 +2001,23 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 						}
 					}
 
-				auth.Status = StatusError
-				auth.UpdatedAt = now
-				updateAggregatedAvailability(auth, now)
-				if auth.Unavailable {
-					entry := logEntryWithRequestID(ctx)
-					errMsg := ""
-					if result.Error != nil {
-						errMsg = result.Error.Message
+					auth.Status = StatusError
+					auth.UpdatedAt = now
+					updateAggregatedAvailability(auth, now)
+					if auth.Unavailable {
+						entry := logEntryWithRequestID(ctx)
+						errMsg := ""
+						if result.Error != nil {
+							errMsg = result.Error.Message
+						}
+						entry.WithFields(log.Fields{
+							"auth_id":     auth.ID,
+							"provider":    result.Provider,
+							"model":       result.Model,
+							"http_status": statusCode,
+							"error":       errMsg,
+						}).Warn("auth marked unavailable due to model error")
 					}
-					entry.WithFields(log.Fields{
-						"auth_id":     auth.ID,
-						"provider":    result.Provider,
-						"model":       result.Model,
-						"http_status": statusCode,
-						"error":       errMsg,
-					}).Warn("auth marked unavailable due to model error")
 				}
 			} else {
 				applyAuthFailureState(auth, result.Error, result.RetryAfter, now)
