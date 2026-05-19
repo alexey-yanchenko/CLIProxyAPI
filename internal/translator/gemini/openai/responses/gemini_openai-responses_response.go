@@ -543,17 +543,15 @@ func ConvertGeminiResponseToOpenAIResponses(_ context.Context, modelName string,
 			completed, _ = sjson.SetBytes(completed, "response.usage.input_tokens", input)
 			// cached token details: align with OpenAI "cached_tokens" semantics.
 			completed, _ = sjson.SetBytes(completed, "response.usage.input_tokens_details.cached_tokens", um.Get("cachedContentTokenCount").Int())
-			// output tokens
-			if v := um.Get("candidatesTokenCount"); v.Exists() {
-				completed, _ = sjson.SetBytes(completed, "response.usage.output_tokens", v.Int())
+			// output tokens (OpenAI semantics: output_tokens includes reasoning_tokens).
+			thoughtsTokens := um.Get("thoughtsTokenCount").Int()
+			candidatesTokens := um.Get("candidatesTokenCount").Int()
+			if um.Get("candidatesTokenCount").Exists() || um.Get("thoughtsTokenCount").Exists() {
+				completed, _ = sjson.SetBytes(completed, "response.usage.output_tokens", candidatesTokens+thoughtsTokens)
 			} else {
 				completed, _ = sjson.SetBytes(completed, "response.usage.output_tokens", 0)
 			}
-			if v := um.Get("thoughtsTokenCount"); v.Exists() {
-				completed, _ = sjson.SetBytes(completed, "response.usage.output_tokens_details.reasoning_tokens", v.Int())
-			} else {
-				completed, _ = sjson.SetBytes(completed, "response.usage.output_tokens_details.reasoning_tokens", 0)
-			}
+			completed, _ = sjson.SetBytes(completed, "response.usage.output_tokens_details.reasoning_tokens", thoughtsTokens)
 			if v := um.Get("totalTokenCount"); v.Exists() {
 				completed, _ = sjson.SetBytes(completed, "response.usage.total_tokens", v.Int())
 			} else {
@@ -750,12 +748,14 @@ func ConvertGeminiResponseToOpenAIResponsesNonStream(_ context.Context, _ string
 		resp, _ = sjson.SetBytes(resp, "usage.input_tokens", input)
 		// cached token details: align with OpenAI "cached_tokens" semantics.
 		resp, _ = sjson.SetBytes(resp, "usage.input_tokens_details.cached_tokens", um.Get("cachedContentTokenCount").Int())
-		// output tokens
-		if v := um.Get("candidatesTokenCount"); v.Exists() {
-			resp, _ = sjson.SetBytes(resp, "usage.output_tokens", v.Int())
+		// output tokens (OpenAI semantics: output_tokens includes reasoning_tokens).
+		thoughtsTokens := um.Get("thoughtsTokenCount").Int()
+		candidatesTokens := um.Get("candidatesTokenCount").Int()
+		if um.Get("candidatesTokenCount").Exists() || um.Get("thoughtsTokenCount").Exists() {
+			resp, _ = sjson.SetBytes(resp, "usage.output_tokens", candidatesTokens+thoughtsTokens)
 		}
-		if v := um.Get("thoughtsTokenCount"); v.Exists() {
-			resp, _ = sjson.SetBytes(resp, "usage.output_tokens_details.reasoning_tokens", v.Int())
+		if thoughtsTokens > 0 {
+			resp, _ = sjson.SetBytes(resp, "usage.output_tokens_details.reasoning_tokens", thoughtsTokens)
 		}
 		if v := um.Get("totalTokenCount"); v.Exists() {
 			resp, _ = sjson.SetBytes(resp, "usage.total_tokens", v.Int())

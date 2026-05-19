@@ -100,14 +100,14 @@ func ConvertGeminiResponseToOpenAI(_ context.Context, _ string, originalRequestR
 	// Usage is applied to the base template so it appears in the chunks.
 	if usageResult := gjson.GetBytes(rawJSON, "usageMetadata"); usageResult.Exists() {
 		cachedTokenCount := usageResult.Get("cachedContentTokenCount").Int()
+		thoughtsTokenCount := usageResult.Get("thoughtsTokenCount").Int()
 		if candidatesTokenCountResult := usageResult.Get("candidatesTokenCount"); candidatesTokenCountResult.Exists() {
-			baseTemplate, _ = sjson.SetBytes(baseTemplate, "usage.completion_tokens", candidatesTokenCountResult.Int())
+			baseTemplate, _ = sjson.SetBytes(baseTemplate, "usage.completion_tokens", candidatesTokenCountResult.Int()+thoughtsTokenCount)
 		}
 		if totalTokenCountResult := usageResult.Get("totalTokenCount"); totalTokenCountResult.Exists() {
 			baseTemplate, _ = sjson.SetBytes(baseTemplate, "usage.total_tokens", totalTokenCountResult.Int())
 		}
 		promptTokenCount := usageResult.Get("promptTokenCount").Int()
-		thoughtsTokenCount := usageResult.Get("thoughtsTokenCount").Int()
 		baseTemplate, _ = sjson.SetBytes(baseTemplate, "usage.prompt_tokens", promptTokenCount)
 		if thoughtsTokenCount > 0 {
 			baseTemplate, _ = sjson.SetBytes(baseTemplate, "usage.completion_tokens_details.reasoning_tokens", thoughtsTokenCount)
