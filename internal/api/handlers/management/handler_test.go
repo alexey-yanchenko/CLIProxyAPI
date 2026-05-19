@@ -15,7 +15,7 @@ func TestAuthenticateManagementKey_LocalhostIPBan_BlocksCorrectKeyDuringBan(t *t
 		envSecret:      "test-secret",
 	}
 
-	for i := 0; i < 5; i++ {
+	for i := 0; i < 20; i++ {
 		allowed, statusCode, errMsg := h.AuthenticateManagementKey("127.0.0.1", true, "wrong-secret")
 		if allowed {
 			t.Fatalf("expected auth to be denied at attempt %d", i+1)
