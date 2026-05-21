@@ -282,12 +282,14 @@ func (e *KimiExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 		scanner := bufio.NewScanner(httpResp.Body)
 		scanner.Buffer(nil, 1_048_576) // 1MB
 		var param any
+		toolCallIDs := newKimiToolCallIDState()
 		for scanner.Scan() {
 			line := scanner.Bytes()
 			helps.AppendAPIResponseChunk(ctx, e.cfg, line)
 			if detail, ok := helps.ParseOpenAIStreamUsage(line); ok {
 				reporter.Publish(ctx, detail)
 			}
+			line = toolCallIDs.normalize(line)
 			chunks := sdktranslator.TranslateStream(ctx, to, from, req.Model, opts.OriginalRequest, body, bytes.Clone(line), &param)
 			for i := range chunks {
 				select {
@@ -746,4 +748,72 @@ func stripKimiPrefix(model string) string {
 		return model[5:]
 	}
 	return model
+}
+
+// kimiToolCallIDState tracks which (choice, tool_call.index) pairs have
+// already emitted an id. Kimi violates the OpenAI streaming spec by sending a
+// fresh id in every tool_call delta chunk, which breaks downstream clients
+// that aggregate by id. We keep the id on the first chunk and strip it from
+// continuations, matching the canonical OpenAI streaming format.
+type kimiToolCallIDState struct {
+	seen map[[2]int]struct{}
+}
+
+func newKimiToolCallIDState() *kimiToolCallIDState {
+	return &kimiToolCallIDState{seen: make(map[[2]int]struct{})}
+}
+
+// normalize strips the `id` field from any tool_call delta after the first
+// chunk for that (choice index, tool_call.index). The first chunk is left
+// untouched so clients can still anchor the call_id by index.
+func (s *kimiToolCallIDState) normalize(line []byte) []byte {
+	trimmed := bytes.TrimSpace(line)
+	if len(trimmed) == 0 || !bytes.HasPrefix(trimmed, []byte("data:")) {
+		return line
+	}
+	payload := bytes.TrimSpace(trimmed[len("data:"):])
+	if len(payload) == 0 || payload[0] != '{' || !gjson.ValidBytes(payload) {
+		return line
+	}
+	choices := gjson.GetBytes(payload, "choices")
+	if !choices.IsArray() {
+		return line
+	}
+
+	out := payload
+	modified := false
+	for choiceIdx, choice := range choices.Array() {
+		toolCalls := choice.Get("delta.tool_calls")
+		if !toolCalls.IsArray() {
+			continue
+		}
+		for arrIdx, tc := range toolCalls.Array() {
+			idField := tc.Get("id")
+			if !idField.Exists() {
+				continue
+			}
+			tcIdx := int(tc.Get("index").Int())
+			key := [2]int{choiceIdx, tcIdx}
+			if _, ok := s.seen[key]; !ok {
+				s.seen[key] = struct{}{}
+				continue
+			}
+			path := fmt.Sprintf("choices.%d.delta.tool_calls.%d.id", choiceIdx, arrIdx)
+			next, err := sjson.DeleteBytes(out, path)
+			if err != nil {
+				log.Debugf("kimi executor: failed to strip tool_call id: %v", err)
+				continue
+			}
+			out = next
+			modified = true
+		}
+	}
+
+	if !modified {
+		return line
+	}
+	rewritten := make([]byte, 0, len("data: ")+len(out))
+	rewritten = append(rewritten, "data: "...)
+	rewritten = append(rewritten, out...)
+	return rewritten
 }
