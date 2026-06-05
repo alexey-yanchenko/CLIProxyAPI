@@ -314,6 +314,63 @@ func SanitizedToolNameMap(rawJSON []byte) map[string]string {
 	return out
 }
 
+// GeminiDeclaredToolNames returns the set of declared function tool names in the
+// sanitized form that Gemini sees and echoes back (including in compositional /
+// tool_code text output). It accepts one or more request payloads in any of the
+// supported shapes and unions the results:
+//   - Gemini requests: tools[].functionDeclarations[].name (already sanitized)
+//   - OpenAI Responses requests: tools[] with {"type":"function","name":...}
+//   - OpenAI Chat requests: tools[] with {"type":"function","function":{"name":...}}
+//
+// Names are sanitized with SanitizeFunctionName (idempotent for already-sanitized
+// names) so the result matches what Gemini emits. The order is deterministic
+// (first occurrence wins) and duplicates are removed.
+func GeminiDeclaredToolNames(rawJSONs ...[]byte) []string {
+	var out []string
+	seen := make(map[string]struct{})
+	add := func(name string) {
+		name = SanitizeFunctionName(strings.TrimSpace(name))
+		if name == "" {
+			return
+		}
+		if _, ok := seen[name]; ok {
+			return
+		}
+		seen[name] = struct{}{}
+		out = append(out, name)
+	}
+
+	for _, rawJSON := range rawJSONs {
+		if len(rawJSON) == 0 || !gjson.ValidBytes(rawJSON) {
+			continue
+		}
+		tools := gjson.GetBytes(rawJSON, "tools")
+		if !tools.Exists() || !tools.IsArray() {
+			continue
+		}
+		tools.ForEach(func(_, tool gjson.Result) bool {
+			// Gemini: functionDeclarations[].name
+			if decls := tool.Get("functionDeclarations"); decls.Exists() && decls.IsArray() {
+				decls.ForEach(func(_, decl gjson.Result) bool {
+					add(decl.Get("name").String())
+					return true
+				})
+			}
+			// OpenAI Chat: function.name
+			if n := tool.Get("function.name"); n.Exists() {
+				add(n.String())
+			}
+			// OpenAI Responses: top-level name
+			if n := tool.Get("name"); n.Exists() {
+				add(n.String())
+			}
+			return true
+		})
+	}
+
+	return out
+}
+
 // RestoreSanitizedToolName looks up a sanitized function name in the provided map
 // and returns the original client-facing name. If no mapping exists, it returns
 // the sanitized name unchanged.

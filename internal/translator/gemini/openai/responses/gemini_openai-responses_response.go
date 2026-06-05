@@ -8,6 +8,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/compositional"
 	translatorcommon "github.com/router-for-me/CLIProxyAPI/v7/internal/translator/common"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	"github.com/tidwall/gjson"
@@ -43,6 +44,12 @@ type geminiToResponsesState struct {
 	FuncCallIDs      map[int]string
 	FuncDone         map[int]bool
 	SanitizedNameMap map[string]string
+
+	// compositional (tool_code) recovery: allowlist of declared tool names and
+	// a hold-back buffer for partial calls spanning streaming chunks.
+	KnownToolNames []string
+	KnownInit      bool
+	CompBuf        string
 }
 
 // responseIDCounter provides a process-wide unique counter for synthesized response identifiers.
@@ -97,6 +104,8 @@ func ConvertGeminiResponseToOpenAIResponses(_ context.Context, modelName string,
 			FuncCallIDs:      make(map[int]string),
 			FuncDone:         make(map[int]bool),
 			SanitizedNameMap: util.SanitizedToolNameMap(originalRequestRawJSON),
+			KnownToolNames:   util.GeminiDeclaredToolNames(requestRawJSON, originalRequestRawJSON),
+			KnownInit:        true,
 		}
 	}
 	st := (*param).(*geminiToResponsesState)
@@ -114,6 +123,10 @@ func ConvertGeminiResponseToOpenAIResponses(_ context.Context, modelName string,
 	}
 	if st.SanitizedNameMap == nil {
 		st.SanitizedNameMap = util.SanitizedToolNameMap(originalRequestRawJSON)
+	}
+	if !st.KnownInit {
+		st.KnownToolNames = util.GeminiDeclaredToolNames(requestRawJSON, originalRequestRawJSON)
+		st.KnownInit = true
 	}
 
 	if bytes.HasPrefix(rawJSON, []byte("data:")) {
@@ -231,6 +244,116 @@ func ConvertGeminiResponseToOpenAIResponses(_ context.Context, modelName string,
 		st.NextIndex = 0
 	}
 
+	// emitAssistantText opens the assistant message item (lazily) and emits a
+	// visible text delta. It is shared by the direct text path and the
+	// compositional residual path.
+	emitAssistantText := func(s string) {
+		if s == "" {
+			return
+		}
+		finalizeReasoning()
+		if !st.MsgOpened {
+			st.MsgOpened = true
+			st.MsgIndex = st.NextIndex
+			st.NextIndex++
+			st.CurrentMsgID = fmt.Sprintf("msg_%s_0", st.ResponseID)
+			item := []byte(`{"type":"response.output_item.added","sequence_number":0,"output_index":0,"item":{"id":"","type":"message","status":"in_progress","content":[],"role":"assistant"}}`)
+			item, _ = sjson.SetBytes(item, "sequence_number", nextSeq())
+			item, _ = sjson.SetBytes(item, "output_index", st.MsgIndex)
+			item, _ = sjson.SetBytes(item, "item.id", st.CurrentMsgID)
+			out = append(out, emitEvent("response.output_item.added", item))
+			partAdded := []byte(`{"type":"response.content_part.added","sequence_number":0,"item_id":"","output_index":0,"content_index":0,"part":{"type":"output_text","annotations":[],"logprobs":[],"text":""}}`)
+			partAdded, _ = sjson.SetBytes(partAdded, "sequence_number", nextSeq())
+			partAdded, _ = sjson.SetBytes(partAdded, "item_id", st.CurrentMsgID)
+			partAdded, _ = sjson.SetBytes(partAdded, "output_index", st.MsgIndex)
+			out = append(out, emitEvent("response.content_part.added", partAdded))
+			st.ItemTextBuf.Reset()
+		}
+		st.TextBuf.WriteString(s)
+		st.ItemTextBuf.WriteString(s)
+		msg := []byte(`{"type":"response.output_text.delta","sequence_number":0,"item_id":"","output_index":0,"content_index":0,"delta":"","logprobs":[]}`)
+		msg, _ = sjson.SetBytes(msg, "sequence_number", nextSeq())
+		msg, _ = sjson.SetBytes(msg, "item_id", st.CurrentMsgID)
+		msg, _ = sjson.SetBytes(msg, "output_index", st.MsgIndex)
+		msg, _ = sjson.SetBytes(msg, "delta", s)
+		out = append(out, emitEvent("response.output_text.delta", msg))
+	}
+
+	// emitFunctionCall emits a complete structured function-call item. Gemini
+	// delivers the whole call in one shot, so arguments are finalized
+	// immediately. name must already be restored to the client-facing name.
+	emitFunctionCall := func(name, argsJSON string) {
+		// Responses streaming requires message/reasoning done events before the
+		// next output_item.added.
+		finalizeReasoning()
+		finalizeMessage()
+		idx := st.NextIndex
+		st.NextIndex++
+		if st.FuncArgsBuf[idx] == nil {
+			st.FuncArgsBuf[idx] = &strings.Builder{}
+		}
+		if st.FuncCallIDs[idx] == "" {
+			st.FuncCallIDs[idx] = fmt.Sprintf("call_%d_%d", time.Now().UnixNano(), atomic.AddUint64(&funcCallIDCounter, 1))
+		}
+		st.FuncNames[idx] = name
+		if argsJSON == "" {
+			argsJSON = "{}"
+		}
+		if st.FuncArgsBuf[idx].Len() == 0 {
+			st.FuncArgsBuf[idx].WriteString(argsJSON)
+		}
+
+		item := []byte(`{"type":"response.output_item.added","sequence_number":0,"output_index":0,"item":{"id":"","type":"function_call","status":"in_progress","arguments":"","call_id":"","name":""}}`)
+		item, _ = sjson.SetBytes(item, "sequence_number", nextSeq())
+		item, _ = sjson.SetBytes(item, "output_index", idx)
+		item, _ = sjson.SetBytes(item, "item.id", fmt.Sprintf("fc_%s", st.FuncCallIDs[idx]))
+		item, _ = sjson.SetBytes(item, "item.call_id", st.FuncCallIDs[idx])
+		item, _ = sjson.SetBytes(item, "item.name", name)
+		out = append(out, emitEvent("response.output_item.added", item))
+
+		ad := []byte(`{"type":"response.function_call_arguments.delta","sequence_number":0,"item_id":"","output_index":0,"delta":""}`)
+		ad, _ = sjson.SetBytes(ad, "sequence_number", nextSeq())
+		ad, _ = sjson.SetBytes(ad, "item_id", fmt.Sprintf("fc_%s", st.FuncCallIDs[idx]))
+		ad, _ = sjson.SetBytes(ad, "output_index", idx)
+		ad, _ = sjson.SetBytes(ad, "delta", argsJSON)
+		out = append(out, emitEvent("response.function_call_arguments.delta", ad))
+
+		fcDone := []byte(`{"type":"response.function_call_arguments.done","sequence_number":0,"item_id":"","output_index":0,"arguments":""}`)
+		fcDone, _ = sjson.SetBytes(fcDone, "sequence_number", nextSeq())
+		fcDone, _ = sjson.SetBytes(fcDone, "item_id", fmt.Sprintf("fc_%s", st.FuncCallIDs[idx]))
+		fcDone, _ = sjson.SetBytes(fcDone, "output_index", idx)
+		fcDone, _ = sjson.SetBytes(fcDone, "arguments", argsJSON)
+		out = append(out, emitEvent("response.function_call_arguments.done", fcDone))
+
+		itemDone := []byte(`{"type":"response.output_item.done","sequence_number":0,"output_index":0,"item":{"id":"","type":"function_call","status":"completed","arguments":"","call_id":"","name":""}}`)
+		itemDone, _ = sjson.SetBytes(itemDone, "sequence_number", nextSeq())
+		itemDone, _ = sjson.SetBytes(itemDone, "output_index", idx)
+		itemDone, _ = sjson.SetBytes(itemDone, "item.id", fmt.Sprintf("fc_%s", st.FuncCallIDs[idx]))
+		itemDone, _ = sjson.SetBytes(itemDone, "item.arguments", argsJSON)
+		itemDone, _ = sjson.SetBytes(itemDone, "item.call_id", st.FuncCallIDs[idx])
+		itemDone, _ = sjson.SetBytes(itemDone, "item.name", st.FuncNames[idx])
+		out = append(out, emitEvent("response.output_item.done", itemDone))
+
+		st.FuncDone[idx] = true
+	}
+
+	// flushCompositional runs the compositional parser over the hold-back buffer,
+	// emitting recovered residual text and structured calls. With final=true the
+	// buffer is drained and any partial call is surfaced as text.
+	flushCompositional := func(final bool) {
+		if len(st.KnownToolNames) == 0 || st.CompBuf == "" {
+			return
+		}
+		calls, residual, tail := compositional.Process(st.CompBuf, st.KnownToolNames, final)
+		st.CompBuf = tail
+		if strings.TrimSpace(residual) != "" {
+			emitAssistantText(residual)
+		}
+		for _, c := range calls {
+			emitFunctionCall(util.RestoreSanitizedToolName(st.SanitizedNameMap, c.Name), c.Arguments)
+		}
+	}
+
 	// Handle parts (text/thought/functionCall)
 	if parts := root.Get("candidates.0.content.parts"); parts.Exists() && parts.IsArray() {
 		parts.ForEach(func(_, part gjson.Result) bool {
@@ -276,103 +399,33 @@ func ConvertGeminiResponseToOpenAIResponses(_ context.Context, modelName string,
 
 			// Assistant visible text
 			if t := part.Get("text"); t.Exists() && t.String() != "" {
-				// Before emitting non-reasoning outputs, finalize reasoning if open.
-				finalizeReasoning()
-				if !st.MsgOpened {
-					st.MsgOpened = true
-					st.MsgIndex = st.NextIndex
-					st.NextIndex++
-					st.CurrentMsgID = fmt.Sprintf("msg_%s_0", st.ResponseID)
-					item := []byte(`{"type":"response.output_item.added","sequence_number":0,"output_index":0,"item":{"id":"","type":"message","status":"in_progress","content":[],"role":"assistant"}}`)
-					item, _ = sjson.SetBytes(item, "sequence_number", nextSeq())
-					item, _ = sjson.SetBytes(item, "output_index", st.MsgIndex)
-					item, _ = sjson.SetBytes(item, "item.id", st.CurrentMsgID)
-					out = append(out, emitEvent("response.output_item.added", item))
-					partAdded := []byte(`{"type":"response.content_part.added","sequence_number":0,"item_id":"","output_index":0,"content_index":0,"part":{"type":"output_text","annotations":[],"logprobs":[],"text":""}}`)
-					partAdded, _ = sjson.SetBytes(partAdded, "sequence_number", nextSeq())
-					partAdded, _ = sjson.SetBytes(partAdded, "item_id", st.CurrentMsgID)
-					partAdded, _ = sjson.SetBytes(partAdded, "output_index", st.MsgIndex)
-					out = append(out, emitEvent("response.content_part.added", partAdded))
-					st.ItemTextBuf.Reset()
+				// Without declared tools, stream text as-is (zero regression, no buffering).
+				if len(st.KnownToolNames) == 0 {
+					emitAssistantText(t.String())
+					return true
 				}
-				st.TextBuf.WriteString(t.String())
-				st.ItemTextBuf.WriteString(t.String())
-				msg := []byte(`{"type":"response.output_text.delta","sequence_number":0,"item_id":"","output_index":0,"content_index":0,"delta":"","logprobs":[]}`)
-				msg, _ = sjson.SetBytes(msg, "sequence_number", nextSeq())
-				msg, _ = sjson.SetBytes(msg, "item_id", st.CurrentMsgID)
-				msg, _ = sjson.SetBytes(msg, "output_index", st.MsgIndex)
-				msg, _ = sjson.SetBytes(msg, "delta", t.String())
-				out = append(out, emitEvent("response.output_text.delta", msg))
+				// With tools, defensively recover compositional (tool_code) calls
+				// that Gemini emitted as text, holding back partial calls.
+				st.CompBuf += t.String()
+				calls, residual, tail := compositional.Process(st.CompBuf, st.KnownToolNames, false)
+				st.CompBuf = tail
+				if strings.TrimSpace(residual) != "" {
+					emitAssistantText(residual)
+				}
+				for _, c := range calls {
+					emitFunctionCall(util.RestoreSanitizedToolName(st.SanitizedNameMap, c.Name), c.Arguments)
+				}
 				return true
 			}
 
 			// Function call
 			if fc := part.Get("functionCall"); fc.Exists() {
-				// Before emitting function-call outputs, finalize reasoning and the message (if open).
-				// Responses streaming requires message done events before the next output_item.added.
-				finalizeReasoning()
-				finalizeMessage()
 				name := util.RestoreSanitizedToolName(st.SanitizedNameMap, fc.Get("name").String())
-				idx := st.NextIndex
-				st.NextIndex++
-				// Ensure buffers
-				if st.FuncArgsBuf[idx] == nil {
-					st.FuncArgsBuf[idx] = &strings.Builder{}
-				}
-				if st.FuncCallIDs[idx] == "" {
-					st.FuncCallIDs[idx] = fmt.Sprintf("call_%d_%d", time.Now().UnixNano(), atomic.AddUint64(&funcCallIDCounter, 1))
-				}
-				st.FuncNames[idx] = name
-
 				argsJSON := "{}"
 				if args := fc.Get("args"); args.Exists() {
 					argsJSON = args.Raw
 				}
-				if st.FuncArgsBuf[idx].Len() == 0 && argsJSON != "" {
-					st.FuncArgsBuf[idx].WriteString(argsJSON)
-				}
-
-				// Emit item.added for function call
-				item := []byte(`{"type":"response.output_item.added","sequence_number":0,"output_index":0,"item":{"id":"","type":"function_call","status":"in_progress","arguments":"","call_id":"","name":""}}`)
-				item, _ = sjson.SetBytes(item, "sequence_number", nextSeq())
-				item, _ = sjson.SetBytes(item, "output_index", idx)
-				item, _ = sjson.SetBytes(item, "item.id", fmt.Sprintf("fc_%s", st.FuncCallIDs[idx]))
-				item, _ = sjson.SetBytes(item, "item.call_id", st.FuncCallIDs[idx])
-				item, _ = sjson.SetBytes(item, "item.name", name)
-				out = append(out, emitEvent("response.output_item.added", item))
-
-				// Emit arguments delta (full args in one chunk).
-				// When Gemini omits args, emit "{}" to keep Responses streaming event order consistent.
-				if argsJSON != "" {
-					ad := []byte(`{"type":"response.function_call_arguments.delta","sequence_number":0,"item_id":"","output_index":0,"delta":""}`)
-					ad, _ = sjson.SetBytes(ad, "sequence_number", nextSeq())
-					ad, _ = sjson.SetBytes(ad, "item_id", fmt.Sprintf("fc_%s", st.FuncCallIDs[idx]))
-					ad, _ = sjson.SetBytes(ad, "output_index", idx)
-					ad, _ = sjson.SetBytes(ad, "delta", argsJSON)
-					out = append(out, emitEvent("response.function_call_arguments.delta", ad))
-				}
-
-				// Gemini emits the full function call payload at once, so we can finalize it immediately.
-				if !st.FuncDone[idx] {
-					fcDone := []byte(`{"type":"response.function_call_arguments.done","sequence_number":0,"item_id":"","output_index":0,"arguments":""}`)
-					fcDone, _ = sjson.SetBytes(fcDone, "sequence_number", nextSeq())
-					fcDone, _ = sjson.SetBytes(fcDone, "item_id", fmt.Sprintf("fc_%s", st.FuncCallIDs[idx]))
-					fcDone, _ = sjson.SetBytes(fcDone, "output_index", idx)
-					fcDone, _ = sjson.SetBytes(fcDone, "arguments", argsJSON)
-					out = append(out, emitEvent("response.function_call_arguments.done", fcDone))
-
-					itemDone := []byte(`{"type":"response.output_item.done","sequence_number":0,"output_index":0,"item":{"id":"","type":"function_call","status":"completed","arguments":"","call_id":"","name":""}}`)
-					itemDone, _ = sjson.SetBytes(itemDone, "sequence_number", nextSeq())
-					itemDone, _ = sjson.SetBytes(itemDone, "output_index", idx)
-					itemDone, _ = sjson.SetBytes(itemDone, "item.id", fmt.Sprintf("fc_%s", st.FuncCallIDs[idx]))
-					itemDone, _ = sjson.SetBytes(itemDone, "item.arguments", argsJSON)
-					itemDone, _ = sjson.SetBytes(itemDone, "item.call_id", st.FuncCallIDs[idx])
-					itemDone, _ = sjson.SetBytes(itemDone, "item.name", st.FuncNames[idx])
-					out = append(out, emitEvent("response.output_item.done", itemDone))
-
-					st.FuncDone[idx] = true
-				}
-
+				emitFunctionCall(name, argsJSON)
 				return true
 			}
 
@@ -382,6 +435,8 @@ func ConvertGeminiResponseToOpenAIResponses(_ context.Context, modelName string,
 
 	// Finalization on finishReason
 	if fr := root.Get("candidates.0.finishReason"); fr.Exists() && fr.String() != "" {
+		// Drain any held-back compositional buffer before finalizing outputs.
+		flushCompositional(true)
 		// Finalize reasoning first to keep ordering tight with last delta
 		finalizeReasoning()
 		finalizeMessage()
@@ -718,6 +773,27 @@ func ConvertGeminiResponseToOpenAIResponsesNonStream(_ context.Context, _ string
 		})
 	}
 
+	// Recover compositional (tool_code) calls that Gemini emitted as text.
+	var compositionalCalls [][]byte
+	if knownNames := util.GeminiDeclaredToolNames(requestRawJSON, originalRequestRawJSON); len(knownNames) > 0 && haveMessage {
+		calls, residual := compositional.Extract(messageText.String(), knownNames)
+		if len(calls) > 0 {
+			messageText.Reset()
+			messageText.WriteString(residual)
+			haveMessage = strings.TrimSpace(residual) != ""
+			for _, c := range calls {
+				name := util.RestoreSanitizedToolName(sanitizedNameMap, c.Name)
+				callID := fmt.Sprintf("call_%x_%d", time.Now().UnixNano(), atomic.AddUint64(&funcCallIDCounter, 1))
+				itemJSON := []byte(`{"id":"","type":"function_call","status":"completed","arguments":"","call_id":"","name":""}`)
+				itemJSON, _ = sjson.SetBytes(itemJSON, "id", fmt.Sprintf("fc_%s", callID))
+				itemJSON, _ = sjson.SetBytes(itemJSON, "call_id", callID)
+				itemJSON, _ = sjson.SetBytes(itemJSON, "name", name)
+				itemJSON, _ = sjson.SetBytes(itemJSON, "arguments", c.Arguments)
+				compositionalCalls = append(compositionalCalls, itemJSON)
+			}
+		}
+	}
+
 	// Reasoning output item
 	if reasoningText.Len() > 0 || reasoningEncrypted != "" {
 		rid := strings.TrimPrefix(id, "resp_")
@@ -738,6 +814,11 @@ func ConvertGeminiResponseToOpenAIResponsesNonStream(_ context.Context, _ string
 		itemJSON := []byte(`{"id":"","type":"message","status":"completed","content":[{"type":"output_text","annotations":[],"logprobs":[],"text":""}],"role":"assistant"}`)
 		itemJSON, _ = sjson.SetBytes(itemJSON, "id", fmt.Sprintf("msg_%s_0", strings.TrimPrefix(id, "resp_")))
 		itemJSON, _ = sjson.SetBytes(itemJSON, "content.0.text", messageText.String())
+		appendOutput(itemJSON)
+	}
+
+	// Recovered compositional function-call output items.
+	for _, itemJSON := range compositionalCalls {
 		appendOutput(itemJSON)
 	}
 

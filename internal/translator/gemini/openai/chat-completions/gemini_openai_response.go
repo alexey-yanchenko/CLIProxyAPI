@@ -13,6 +13,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/compositional"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
@@ -25,6 +26,12 @@ type convertGeminiResponseToOpenAIChatParams struct {
 	// FunctionIndex tracks tool call indices per candidate index to support multiple candidates.
 	FunctionIndex    map[int]int
 	SanitizedNameMap map[string]string
+
+	// compositional (tool_code) recovery: allowlist of declared tool names and
+	// a per-candidate hold-back buffer for partial calls spanning chunks.
+	KnownToolNames []string
+	KnownInit      bool
+	CompBuf        map[int]string
 }
 
 // functionCallIDCounter provides a process-wide unique counter for function call identifiers.
@@ -51,6 +58,9 @@ func ConvertGeminiResponseToOpenAI(_ context.Context, _ string, originalRequestR
 			UnixTimestamp:    0,
 			FunctionIndex:    make(map[int]int),
 			SanitizedNameMap: util.SanitizedToolNameMap(originalRequestRawJSON),
+			KnownToolNames:   util.GeminiDeclaredToolNames(requestRawJSON, originalRequestRawJSON),
+			KnownInit:        true,
+			CompBuf:          make(map[int]string),
 		}
 	}
 
@@ -61,6 +71,13 @@ func ConvertGeminiResponseToOpenAI(_ context.Context, _ string, originalRequestR
 	}
 	if p.SanitizedNameMap == nil {
 		p.SanitizedNameMap = util.SanitizedToolNameMap(originalRequestRawJSON)
+	}
+	if p.CompBuf == nil {
+		p.CompBuf = make(map[int]string)
+	}
+	if !p.KnownInit {
+		p.KnownToolNames = util.GeminiDeclaredToolNames(requestRawJSON, originalRequestRawJSON)
+		p.KnownInit = true
 	}
 
 	if bytes.HasPrefix(rawJSON, []byte("data:")) {
@@ -149,6 +166,40 @@ func ConvertGeminiResponseToOpenAI(_ context.Context, _ string, originalRequestR
 			partsResult := candidate.Get("content.parts")
 			hasFunctionCall := false
 
+			// addToolCall appends a structured tool call to the current delta,
+			// shared by native functionCall parts and recovered compositional calls.
+			addToolCall := func(template []byte, name, argsJSON string) []byte {
+				hasFunctionCall = true
+				toolCallsResult := gjson.GetBytes(template, "choices.0.delta.tool_calls")
+				functionCallIndex := p.FunctionIndex[candidateIndex]
+				p.FunctionIndex[candidateIndex]++
+				if toolCallsResult.Exists() && toolCallsResult.IsArray() {
+					functionCallIndex = len(toolCallsResult.Array())
+				} else {
+					template, _ = sjson.SetRawBytes(template, "choices.0.delta.tool_calls", []byte(`[]`))
+				}
+				fcTpl := []byte(`{"id":"","index":0,"type":"function","function":{"name":"","arguments":""}}`)
+				fcTpl, _ = sjson.SetBytes(fcTpl, "id", fmt.Sprintf("%s-%d-%d", name, time.Now().UnixNano(), atomic.AddUint64(&functionCallIDCounter, 1)))
+				fcTpl, _ = sjson.SetBytes(fcTpl, "index", functionCallIndex)
+				fcTpl, _ = sjson.SetBytes(fcTpl, "function.name", name)
+				if argsJSON != "" {
+					fcTpl, _ = sjson.SetBytes(fcTpl, "function.arguments", argsJSON)
+				}
+				template, _ = sjson.SetBytes(template, "choices.0.delta.role", "assistant")
+				template, _ = sjson.SetRawBytes(template, "choices.0.delta.tool_calls.-1", fcTpl)
+				return template
+			}
+
+			// appendContent concatenates visible text into the current delta.
+			appendContent := func(template []byte, text string) []byte {
+				if existing := gjson.GetBytes(template, "choices.0.delta.content"); existing.Exists() && existing.Type == gjson.String {
+					text = existing.String() + text
+				}
+				template, _ = sjson.SetBytes(template, "choices.0.delta.content", text)
+				template, _ = sjson.SetBytes(template, "choices.0.delta.role", "assistant")
+				return template
+			}
+
 			if partsResult.IsArray() {
 				partResults := partsResult.Array()
 				for i := 0; i < len(partResults); i++ {
@@ -177,35 +228,32 @@ func ConvertGeminiResponseToOpenAI(_ context.Context, _ string, originalRequestR
 						// Handle text content, distinguishing between regular content and reasoning/thoughts.
 						if partResult.Get("thought").Bool() {
 							template, _ = sjson.SetBytes(template, "choices.0.delta.reasoning_content", text)
-						} else {
+							template, _ = sjson.SetBytes(template, "choices.0.delta.role", "assistant")
+						} else if len(p.KnownToolNames) == 0 {
+							// No declared tools: stream text as-is (zero regression).
 							template, _ = sjson.SetBytes(template, "choices.0.delta.content", text)
+							template, _ = sjson.SetBytes(template, "choices.0.delta.role", "assistant")
+						} else {
+							// With tools, defensively recover compositional (tool_code)
+							// calls emitted as text, holding back partial calls.
+							p.CompBuf[candidateIndex] += text
+							calls, residual, tail := compositional.Process(p.CompBuf[candidateIndex], p.KnownToolNames, false)
+							p.CompBuf[candidateIndex] = tail
+							if strings.TrimSpace(residual) != "" {
+								template = appendContent(template, residual)
+							}
+							for _, c := range calls {
+								template = addToolCall(template, util.RestoreSanitizedToolName(p.SanitizedNameMap, c.Name), c.Arguments)
+							}
 						}
-						template, _ = sjson.SetBytes(template, "choices.0.delta.role", "assistant")
 					} else if functionCallResult.Exists() {
 						// Handle function call content.
-						hasFunctionCall = true
-						toolCallsResult := gjson.GetBytes(template, "choices.0.delta.tool_calls")
-
-						// Retrieve the function index for this specific candidate.
-						functionCallIndex := p.FunctionIndex[candidateIndex]
-						p.FunctionIndex[candidateIndex]++
-
-						if toolCallsResult.Exists() && toolCallsResult.IsArray() {
-							functionCallIndex = len(toolCallsResult.Array())
-						} else {
-							template, _ = sjson.SetRawBytes(template, "choices.0.delta.tool_calls", []byte(`[]`))
-						}
-
-						functionCallTemplate := []byte(`{"id":"","index":0,"type":"function","function":{"name":"","arguments":""}}`)
 						fcName := util.RestoreSanitizedToolName(p.SanitizedNameMap, functionCallResult.Get("name").String())
-						functionCallTemplate, _ = sjson.SetBytes(functionCallTemplate, "id", fmt.Sprintf("%s-%d-%d", fcName, time.Now().UnixNano(), atomic.AddUint64(&functionCallIDCounter, 1)))
-						functionCallTemplate, _ = sjson.SetBytes(functionCallTemplate, "index", functionCallIndex)
-						functionCallTemplate, _ = sjson.SetBytes(functionCallTemplate, "function.name", fcName)
+						argsJSON := ""
 						if fcArgsResult := functionCallResult.Get("args"); fcArgsResult.Exists() {
-							functionCallTemplate, _ = sjson.SetBytes(functionCallTemplate, "function.arguments", fcArgsResult.Raw)
+							argsJSON = fcArgsResult.Raw
 						}
-						template, _ = sjson.SetBytes(template, "choices.0.delta.role", "assistant")
-						template, _ = sjson.SetRawBytes(template, "choices.0.delta.tool_calls.-1", functionCallTemplate)
+						template = addToolCall(template, fcName, argsJSON)
 					} else if inlineDataResult.Exists() {
 						data := inlineDataResult.Get("data").String()
 						if data == "" {
@@ -229,6 +277,20 @@ func ConvertGeminiResponseToOpenAI(_ context.Context, _ string, originalRequestR
 						imagePayload, _ = sjson.SetBytes(imagePayload, "image_url.url", imageURL)
 						template, _ = sjson.SetBytes(template, "choices.0.delta.role", "assistant")
 						template, _ = sjson.SetRawBytes(template, "choices.0.delta.images.-1", imagePayload)
+					}
+				}
+			}
+
+			// On the terminal chunk, drain any held-back compositional buffer.
+			if finishReason != "" && len(p.KnownToolNames) > 0 {
+				if buf := p.CompBuf[candidateIndex]; buf != "" {
+					calls, residual, _ := compositional.Process(buf, p.KnownToolNames, true)
+					p.CompBuf[candidateIndex] = ""
+					if strings.TrimSpace(residual) != "" {
+						template = appendContent(template, residual)
+					}
+					for _, c := range calls {
+						template = addToolCall(template, util.RestoreSanitizedToolName(p.SanitizedNameMap, c.Name), c.Arguments)
 					}
 				}
 			}
@@ -272,6 +334,7 @@ func ConvertGeminiResponseToOpenAI(_ context.Context, _ string, originalRequestR
 //   - []byte: An OpenAI-compatible JSON response containing all message content and metadata
 func ConvertGeminiResponseToOpenAINonStream(_ context.Context, _ string, originalRequestRawJSON, requestRawJSON, rawJSON []byte, _ *any) []byte {
 	sanitizedNameMap := util.SanitizedToolNameMap(originalRequestRawJSON)
+	knownToolNames := util.GeminiDeclaredToolNames(requestRawJSON, originalRequestRawJSON)
 	var unixTimestamp int64
 	// Initialize template with an empty choices array to support multiple candidates.
 	template := []byte(`{"id":"","object":"chat.completion","created":123456,"model":"model","choices":[]}`)
@@ -395,6 +458,32 @@ func ConvertGeminiResponseToOpenAINonStream(_ context.Context, _ string, origina
 							imagePayload, _ = sjson.SetBytes(imagePayload, "image_url.url", imageURL)
 							choiceTemplate, _ = sjson.SetBytes(choiceTemplate, "message.role", "assistant")
 							choiceTemplate, _ = sjson.SetRawBytes(choiceTemplate, "message.images.-1", imagePayload)
+						}
+					}
+				}
+			}
+
+			// Recover compositional (tool_code) calls that Gemini emitted as text.
+			if len(knownToolNames) > 0 {
+				if content := gjson.GetBytes(choiceTemplate, "message.content").String(); content != "" {
+					calls, residual := compositional.Extract(content, knownToolNames)
+					if len(calls) > 0 {
+						if strings.TrimSpace(residual) == "" {
+							choiceTemplate, _ = sjson.SetRawBytes(choiceTemplate, "message.content", []byte("null"))
+						} else {
+							choiceTemplate, _ = sjson.SetBytes(choiceTemplate, "message.content", residual)
+						}
+						if !gjson.GetBytes(choiceTemplate, "message.tool_calls").IsArray() {
+							choiceTemplate, _ = sjson.SetRawBytes(choiceTemplate, "message.tool_calls", []byte(`[]`))
+						}
+						for _, c := range calls {
+							hasFunctionCall = true
+							name := util.RestoreSanitizedToolName(sanitizedNameMap, c.Name)
+							item := []byte(`{"id":"","type":"function","function":{"name":"","arguments":""}}`)
+							item, _ = sjson.SetBytes(item, "id", fmt.Sprintf("%s-%d-%d", name, time.Now().UnixNano(), atomic.AddUint64(&functionCallIDCounter, 1)))
+							item, _ = sjson.SetBytes(item, "function.name", name)
+							item, _ = sjson.SetBytes(item, "function.arguments", c.Arguments)
+							choiceTemplate, _ = sjson.SetRawBytes(choiceTemplate, "message.tool_calls.-1", item)
 						}
 					}
 				}
