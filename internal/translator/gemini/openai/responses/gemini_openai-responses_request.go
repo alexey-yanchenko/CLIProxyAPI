@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"strings"
 
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/misc"
 	sigcompat "github.com/router-for-me/CLIProxyAPI/v7/internal/signature"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/translator/gemini/common"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
@@ -237,6 +238,49 @@ func ConvertOpenAIResponsesRequestToGemini(modelName string, inputRawJSON []byte
 									partJSON, _ = sjson.SetBytes(partJSON, "inline_data.mime_type", mimeType)
 									partJSON, _ = sjson.SetBytes(partJSON, "inline_data.data", data)
 								}
+							}
+						case "input_file":
+							fileData := contentItem.Get("file_data").String()
+							if fileData == "" {
+								fileData = contentItem.Get("file.file_data").String()
+							}
+							filename := contentItem.Get("filename").String()
+							if filename == "" {
+								filename = contentItem.Get("file.filename").String()
+							}
+							mimeType := ""
+							data := fileData
+							if strings.HasPrefix(fileData, "data:") {
+								trimmed := strings.TrimPrefix(fileData, "data:")
+								mediaAndData := strings.SplitN(trimmed, ";base64,", 2)
+								if len(mediaAndData) == 2 {
+									if mediaAndData[0] != "" {
+										mimeType = mediaAndData[0]
+									}
+									data = mediaAndData[1]
+								} else {
+									mediaAndData = strings.SplitN(trimmed, ",", 2)
+									if len(mediaAndData) == 2 {
+										if mediaAndData[0] != "" {
+											mimeType = mediaAndData[0]
+										}
+										data = mediaAndData[1]
+									}
+								}
+							}
+							if mimeType == "" {
+								ext := ""
+								if sp := strings.Split(filename, "."); len(sp) > 1 {
+									ext = sp[len(sp)-1]
+								}
+								if mapped, ok := misc.MimeTypes[ext]; ok {
+									mimeType = mapped
+								}
+							}
+							if data != "" && mimeType != "" {
+								partJSON = []byte(`{"inline_data":{"mime_type":"","data":""}}`)
+								partJSON, _ = sjson.SetBytes(partJSON, "inline_data.mime_type", mimeType)
+								partJSON, _ = sjson.SetBytes(partJSON, "inline_data.data", data)
 							}
 						case "input_audio":
 							audioData := contentItem.Get("data").String()

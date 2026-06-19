@@ -129,6 +129,46 @@ func TestConvertOpenAIResponsesRequestToGemini_SystemAndDeveloperRoles(t *testin
 	}
 }
 
+func TestConvertOpenAIResponsesRequestToGemini_InputFile(t *testing.T) {
+	input := []byte(`{
+		"input": [
+			{
+				"type": "message",
+				"role": "user",
+				"content": [
+					{
+						"type": "input_text",
+						"text": "Summarize this file"
+					},
+					{
+						"type": "input_file",
+						"filename": "sample.pdf",
+						"file_data": "data:application/pdf;base64,JVBERi0xLjQK"
+					}
+				]
+			}
+		]
+	}`)
+
+	output := ConvertOpenAIResponsesRequestToGemini("gemini-3.5-flash", input, false)
+	result := gjson.ParseBytes(output)
+
+	parts := result.Get("contents.0.parts")
+	if got := parts.Get("#").Int(); got != 2 {
+		t.Fatalf("parts = %d, want 2. Output: %s", got, output)
+	}
+	inline := parts.Get("1.inline_data")
+	if !inline.Exists() {
+		t.Fatalf("input_file was dropped, no inline_data. Output: %s", output)
+	}
+	if got := inline.Get("mime_type").String(); got != "application/pdf" {
+		t.Fatalf("mime_type = %q, want %q. Output: %s", got, "application/pdf", output)
+	}
+	if got := inline.Get("data").String(); got != "JVBERi0xLjQK" {
+		t.Fatalf("data = %q, want %q. Output: %s", got, "JVBERi0xLjQK", output)
+	}
+}
+
 func validResponsesGPTReasoningSignature() string {
 	raw := make([]byte, 1+8+16+16+32)
 	raw[0] = 0x80
