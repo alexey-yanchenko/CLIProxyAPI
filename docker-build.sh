@@ -42,7 +42,7 @@ case "$choice" in
     echo "----------------------------------------"
 
     # Build and start the services with a local-only image tag
-    export CLI_PROXY_IMAGE="cr.selcloud.ru/maildealer/cli-proxy-api:v0.31"
+    export CLI_PROXY_IMAGE="cr.selcloud.ru/maildealer/cli-proxy-api:v0.34"
 
     echo "Building the Docker image..."
     docker compose build \
